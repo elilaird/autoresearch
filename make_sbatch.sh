@@ -1,20 +1,37 @@
 #!/usr/bin/env zsh
 
-# Submit a single autoresearch training run to SLURM.
-# Called from inside an agent's worktree directory.
-# Returns the job ID and log path so the agent can poll for completion.
+# Submit an autoresearch job to SLURM.
 #
-# Usage (from inside a worktree):
+# Two modes:
+#   MODE=train (default) — submit a single python train.py run.
+#       The Claude agent runs on the login node, submits jobs, polls results.
+#       Use this when you're connected and watching.
+#
+#   MODE=agent — submit a full autonomous Claude Code agent as the SLURM job.
+#       Claude runs inside the job with GPU access, no login session needed.
+#       Use this to run overnight / when you disconnect.
+#
+# All agents sharing the same TAG share the same results.tsv and directions.md
+# on lustre, regardless of mode. This prevents duplicated work across agents.
+#
+# Usage (from inside an agent's worktree):
+#   # Option A: single training run (agent on login node polls for this)
 #   TAG=mar23 ./make_sbatch.sh
 #
-#   # Override time/partition
-#   TAG=mar23 TIME=0-01:00:00 PARTITION=short ./make_sbatch.sh
+#   # Option B: autonomous agent in SLURM (survives disconnect)
+#   TAG=mar23 MODE=agent AGENT=0 ./make_sbatch.sh
+#   TAG=mar23 MODE=agent AGENT=1 TIME=0-12:00:00 ./make_sbatch.sh
+#
+#   # Mix both: some agents on login node, some in SLURM — all share results
+#   # Terminal 1 (login node): cd agents/mar23-0 && claude
+#   # Terminal 2: cd agents/mar23-1 && TAG=mar23 MODE=agent AGENT=1 ./make_sbatch.sh
 
 DATETIME=$(date +"%Y%m%d_%H%M%S")
 
 TAG=${TAG:?"ERROR: TAG is required. Usage: TAG=mar23 ./make_sbatch.sh"}
+MODE=${MODE:-train}
+AGENT=${AGENT:-0}
 
-TIME=${TIME:-0-01:00:00}
 PARTITION=${PARTITION:-batch}
 CONDA_ENV=${CONDA_ENV:-world_models}
 GPU=${GPU:-1}
@@ -24,22 +41,60 @@ PY_ARGS="${@}"
 
 ENV_DIR=${ENV_DIR:-"/lustre/smuexa01/client/users/ejlaird/envs"}
 
-# The working directory is the agent's worktree (where this script is called from)
+# Shared coordination directory — ALL agents with the same TAG use this
+SHARED_DIR=${SHARED_DIR:-"/lustre/smuexa01/client/users/ejlaird/autoresearch/shared/${TAG}"}
+
+# The working directory is the agent's worktree
 WORKTREE_DIR=$(pwd)
 
-COMMAND="python train.py ${PY_ARGS}"
+# Default time: 1h for train mode, 8h for agent mode
+if [ "${MODE}" = "agent" ]; then
+    TIME=${TIME:-0-08:00:00}
+else
+    TIME=${TIME:-0-01:00:00}
+fi
 
-# Ensure output directory exists
+# Agent mode requires API key
+if [ "${MODE}" = "agent" ]; then
+    if [ -z "${ANTHROPIC_API_KEY}" ]; then
+        echo "ERROR: ANTHROPIC_API_KEY must be set for MODE=agent"
+        echo "Usage: ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent ./make_sbatch.sh"
+        exit 1
+    fi
+fi
+
+# Ensure directories exist
 mkdir -p ${WORKTREE_DIR}/output/train
+mkdir -p ${SHARED_DIR}
 
-# Output log path (the agent will read this after the job finishes)
-LOG_PATH="${WORKTREE_DIR}/output/train/run_${DATETIME}.out"
+# Initialize shared files if they don't exist (idempotent)
+if [ ! -f "${SHARED_DIR}/results.tsv" ]; then
+    printf "agent\tcommit\tval_dt_score\tmemory_gb\tstatus\tdescription\n" > "${SHARED_DIR}/results.tsv"
+fi
+if [ ! -f "${SHARED_DIR}/directions.md" ]; then
+    cat > "${SHARED_DIR}/directions.md" << 'DIRECTIONS_EOF'
+# Shared experiment directions
 
-# Write sbatch script
-SBATCH_FILE="${WORKTREE_DIR}/output/train/run_${DATETIME}.sbatch"
-cat > ${SBATCH_FILE} << SBATCH_EOF
+This file is shared across all agents in this run.
+Before starting an experiment, check what others have tried.
+After completing an experiment, log your findings here.
+
+## Claimed directions
+<!-- Format: - agent <id>: <direction description> -->
+
+## Key findings
+<!-- Format: - agent <id>: <finding> (commit <hash>, val_dt_score=<score>) -->
+DIRECTIONS_EOF
+fi
+
+# --- Build sbatch script ---
+
+LOG_PATH="${WORKTREE_DIR}/output/train/${MODE}_${DATETIME}.out"
+SBATCH_FILE="${WORKTREE_DIR}/output/train/${MODE}_${DATETIME}.sbatch"
+
+cat > ${SBATCH_FILE} << SBATCH_HEADER
 #!/usr/bin/env zsh
-#SBATCH -J ar-${TAG}
+#SBATCH -J ar-${TAG}-${MODE}
 #SBATCH -A coreyc_coreyc_mp_jepa_0001
 #SBATCH -o ${LOG_PATH}
 #SBATCH --cpus-per-task=${CPUS}
@@ -57,19 +112,46 @@ conda activate ${ENV_DIR}/${CONDA_ENV}
 
 cd ${WORKTREE_DIR}
 
-echo "=== AUTORESEARCH RUN ==="
+# Shared state — available to both python and claude
+export AUTORESEARCH_SHARED_DIR="${SHARED_DIR}"
+export AUTORESEARCH_AGENT_ID="${AGENT}"
+export AUTORESEARCH_TAG="${TAG}"
+
+echo "=== AUTORESEARCH ==="
+echo "MODE: ${MODE}"
 echo "TAG: ${TAG}"
+echo "AGENT: ${AGENT}"
+echo "SHARED_DIR: ${SHARED_DIR}"
 echo "SLURM_JOB_ID: \${SLURM_JOB_ID}"
 echo "Working dir: ${WORKTREE_DIR}"
 echo "Branch: \$(git branch --show-current)"
 echo "Commit: \$(git rev-parse --short HEAD)"
-echo "Command: ${COMMAND}"
-echo "========================"
+echo "===================="
 
-${COMMAND}
-SBATCH_EOF
+SBATCH_HEADER
 
-# Submit and capture job ID
+if [ "${MODE}" = "train" ]; then
+    cat >> ${SBATCH_FILE} << TRAIN_EOF
+
+python train.py ${PY_ARGS}
+TRAIN_EOF
+
+elif [ "${MODE}" = "agent" ]; then
+    cat >> ${SBATCH_FILE} << AGENT_EOF
+
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"
+export PYTHONUNBUFFERED=1
+
+PROMPT="Read program.md and start the experiment loop. Tag=${TAG}, Agent=${AGENT}. Shared dir: ${SHARED_DIR}. Run autonomously — do not ask questions. You have direct GPU access — run python train.py directly, do NOT use make_sbatch.sh."
+
+# --output-format=stream-json prints all agent activity (tool calls, reasoning, results) to stdout
+# which SLURM captures in the -o log file
+claude --dangerously-skip-permissions --output-format=stream-json -p "\${PROMPT}" 2>&1
+AGENT_EOF
+fi
+
+# --- Submit ---
+
 SBATCH_OUTPUT=$(sbatch ${SBATCH_FILE} 2>&1)
 JOB_ID=$(echo ${SBATCH_OUTPUT} | grep -oP '\d+$')
 
@@ -79,9 +161,9 @@ if [ -z "${JOB_ID}" ]; then
     exit 1
 fi
 
-# Print machine-readable output for the agent to parse
 echo "SUBMITTED_JOB_ID=${JOB_ID}"
 echo "LOG_PATH=${LOG_PATH}"
+echo "MODE=${MODE}"
+echo "SHARED_DIR=${SHARED_DIR}"
 
-# Clean up sbatch file
 rm -f ${SBATCH_FILE}

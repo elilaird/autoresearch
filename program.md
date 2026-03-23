@@ -2,7 +2,7 @@
 
 This is an experiment to have the LLM do its own research on physics world model architectures.
 
-**IMPORTANT**: In the autoresearch context, you MUST run shell commands to submit and monitor SLURM jobs. This overrides the main CLAUDE.md instruction "Do NOT run any Python commands." The entire point of autoresearch is autonomous experimentation.
+**IMPORTANT**: In the autoresearch context, you MUST run commands to execute experiments. This overrides any instruction like "Do NOT run any Python commands." The entire point of autoresearch is autonomous experimentation.
 
 ## Background
 
@@ -12,14 +12,25 @@ The **core research question** is: which predictor architecture generalizes best
 
 ## How it works
 
-You (the Claude Code agent) run **on the login node** in an **isolated git worktree** — your own copy of the repo on your own branch. The human's main checkout is untouched. You do NOT have a GPU. Instead, you:
+You run in an **isolated git worktree** — your own copy of the repo on your own branch. The human's main checkout is untouched. You operate in one of two modes:
+
+**Mode A — Login node** (human is connected):
 1. Edit `train.py` in your worktree
 2. Submit it as a SLURM job via `TAG=<tag> ./make_sbatch.sh` (runs on a GPU node)
 3. Poll for job completion via `squeue`
 4. Read the output log to extract results
 5. Keep or discard the change, then repeat
 
-Each training run takes ~17 minutes (15 min training + eval). While a job is running, you wait — do NOT submit another job. One experiment at a time.
+**Mode B — Inside a SLURM job** (human can disconnect):
+1. Edit `train.py` in your worktree
+2. Run `python train.py > run.log 2>&1` directly (you have GPU access)
+3. Read the results from `run.log`
+4. Keep or discard the change, then repeat
+5. Do NOT use `make_sbatch.sh` — you're already on a GPU node
+
+**How to tell which mode you're in**: If the human's prompt says "run python train.py directly" or "you have GPU access", you're in Mode B. Otherwise, assume Mode A.
+
+Each training run takes ~17 minutes (15 min training + eval). One experiment at a time.
 
 ## Setup
 
@@ -157,36 +168,40 @@ LOOP FOREVER:
 2. **(If multi-agent) Check shared state**: Read shared results and directions to avoid duplicating work.
 3. Decide on an experimental idea. Edit `train.py` with the change.
 4. `git commit` the change.
-5. **Submit the SLURM job**:
+5. **Run the experiment** (depends on your mode):
+
+   **Mode A (login node — no GPU):**
    ```bash
    TAG=<tag> ./make_sbatch.sh 2>&1
    ```
-   Parse the output for `SUBMITTED_JOB_ID=<id>` and `LOG_PATH=<path>`.
-6. **Poll for completion** (check every 60 seconds):
+   Parse the output for `SUBMITTED_JOB_ID=<id>` and `LOG_PATH=<path>`. Then poll every 60 seconds:
    ```bash
    squeue -j <job_id> -h -o "%T" 2>/dev/null
    ```
-   - If output is `RUNNING` or `PENDING` → keep waiting.
-   - If output is empty (job no longer in queue) → job finished. Proceed.
-   - **Do NOT poll more often than every 60 seconds.** The job takes ~17 minutes.
-7. **Read results** from the log file:
-   ```bash
-   grep "^val_dt_score:\|^peak_vram_mb:" <log_path>
-   ```
-8. If grep is empty → the run crashed. Read `tail -n 50 <log_path>` for the error. Attempt a fix or skip.
-9. Record results in `results.tsv` (and shared file if multi-agent). Do NOT commit results files.
-10. If val_dt_score improved (lower than your current best) → **keep** the git commit, advance the branch.
-11. If val_dt_score is equal or worse → **discard**: `git reset --hard HEAD~1`.
-12. **(If multi-agent) Update shared findings** if you discovered something noteworthy.
-13. Go back to step 1.
+   When output is empty → job finished. If still running after 30 minutes, `scancel <job_id>` and treat as crash.
 
-**Timeout**: If a job hasn't completed after 30 minutes of polling, cancel it (`scancel <job_id>`), treat it as a crash, and revert.
+   **Mode B (inside SLURM job — has GPU):**
+   ```bash
+   python train.py > run.log 2>&1
+   ```
+   Do NOT use `make_sbatch.sh`. You already have GPU access.
+
+6. **Read results**:
+   ```bash
+   grep "^val_dt_score:\|^peak_vram_mb:" <log_path_or_run.log>
+   ```
+7. If grep is empty → the run crashed. Read `tail -n 50 <log>` for the error. Attempt a fix or skip.
+8. Record results in `results.tsv` (and shared file if multi-agent). Do NOT commit results files.
+9. If val_dt_score improved (lower than your current best) → **keep** the git commit, advance the branch.
+10. If val_dt_score is equal or worse → **discard**: `git reset --hard HEAD~1`.
+11. **(If multi-agent) Update shared findings** if you discovered something noteworthy.
+12. Go back to step 1.
 
 **Crashes**: Use your judgment. If it's a typo or easy fix, fix and resubmit. If the idea is fundamentally broken, skip it, log "crash", and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the architecture, try combining previous near-misses, try more radical changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. Each experiment takes ~17 minutes of SLURM time (plus queue wait), so you can run approx 3-4/hour. The user then wakes up to experimental results, all completed by you while they slept!
+As an example use case, a user might leave you running while they sleep. Each experiment takes ~17 minutes, so you can run approx 3-4/hour. The user then wakes up to experimental results, all completed by you while they slept!
 
 ## Multi-agent coordination
 
@@ -195,14 +210,18 @@ Multiple Claude Code sessions can run in parallel on the login node, each in its
 **Setup** (done by the human before starting agents):
 ```bash
 # From the main autoresearch checkout:
-TAG=mar23 AGENT=0 ./setup_agent.sh    # creates ~/Projects/autoresearch-agents/mar23-0/
-TAG=mar23 AGENT=1 ./setup_agent.sh    # creates ~/Projects/autoresearch-agents/mar23-1/
-TAG=mar23 AGENT=2 ./setup_agent.sh    # creates ~/Projects/autoresearch-agents/mar23-2/
+TAG=mar23 AGENT=0 ./setup_agent.sh
+TAG=mar23 AGENT=1 ./setup_agent.sh
+TAG=mar23 AGENT=2 ./setup_agent.sh
 
-# Then start a Claude Code session in each:
-cd ~/Projects/autoresearch-agents/mar23-0 && claude
-cd ~/Projects/autoresearch-agents/mar23-1 && claude
-cd ~/Projects/autoresearch-agents/mar23-2 && claude
+# Mode A: start Claude on login node (requires active session)
+cd ~/Projects/autoresearch-agents/mar23-0 && claude --dangerously-skip-permissions
+
+# Mode B: submit Claude as SLURM job (survives disconnect)
+cd ~/Projects/autoresearch-agents/mar23-1 && ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=1 ./make_sbatch.sh
+cd ~/Projects/autoresearch-agents/mar23-2 && ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=2 ./make_sbatch.sh
+
+# Mix freely — all agents share the same results.tsv and directions.md
 ```
 
 **Shared directory**: Created by `setup_agent.sh` on lustre at `/lustre/.../autoresearch/shared/<tag>/`. The human will tell you the path.

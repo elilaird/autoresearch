@@ -38,7 +38,6 @@ Training uses the HGN (Hamiltonian Generative Network) approach: encode all fram
 conda activate world_models
 
 # 2. Verify data exists (checks dataset on lustre, prints stats)
-cd autoresearch
 python prepare.py
 
 # 3. Run a single training experiment (~17 min: 15 min training + eval)
@@ -56,31 +55,93 @@ export DATA_ROOT=/path/to/your/datasets
 python prepare.py  # should find oscillator_visual_60k_dt20Hz/
 ```
 
-## Running the agent
+## Running agents
 
-Spin up Claude Code (or any coding agent) in this directory, then prompt:
+Each agent runs in its own **git worktree** — an isolated copy of the repo on its own branch. Your main checkout is never touched.
 
-```
-Read program.md and let's kick off a new experiment! Let's do the setup first.
-```
+### Step 1: Create worktrees
 
-The agent will:
-1. Create a branch `autoresearch/<tag>`
-2. Run the baseline to establish the starting `val_dt_score`
-3. Begin the autonomous experiment loop — modifying `train.py`, running, evaluating, keeping or discarding
-
-Each experiment takes ~17 minutes. The agent runs indefinitely until you stop it.
-
-### On a SLURM cluster
-
-Submit as a SLURM job with enough time for many experiments:
+From the main autoresearch checkout, create one worktree per agent:
 
 ```bash
-# Example: 8 hours = ~30 experiments
-GPU=1 CPUS=16 MEM=96G TIME=0-08:00:00 PARTITION=batch \
-    CONDA_ENV=world_models ./make_sbatch.sh \
-    cd autoresearch && claude --print "read program.md and start experimenting"
+TAG=mar23 AGENT=0 ./setup_agent.sh
+TAG=mar23 AGENT=1 ./setup_agent.sh
+TAG=mar23 AGENT=2 ./setup_agent.sh
 ```
+
+This creates:
+- `~/Projects/autoresearch-agents/mar23-0/` on branch `autoresearch/mar23-0`
+- `~/Projects/autoresearch-agents/mar23-1/` on branch `autoresearch/mar23-1`
+- `~/Projects/autoresearch-agents/mar23-2/` on branch `autoresearch/mar23-2`
+- Shared coordination dir on lustre: `/lustre/.../autoresearch/shared/mar23/`
+
+### Step 2: Start agents
+
+Two options. You can mix them freely — all agents share the same `results.tsv` and `directions.md` on lustre, so no work is duplicated regardless of mode.
+
+#### Option A: Login node (requires active session)
+
+You stay connected. Claude runs on the login node and submits SLURM jobs for each training run. Good for watching progress interactively.
+
+```bash
+cd ~/Projects/autoresearch-agents/mar23-0
+claude --dangerously-skip-permissions
+```
+
+Then tell Claude:
+```
+Read program.md and start the experiment loop. Tag=mar23, Agent=0.
+Shared dir: /lustre/.../autoresearch/shared/mar23
+Do not ask me any questions. Run autonomously until I stop you.
+```
+
+Claude will edit `train.py`, submit SLURM jobs via `make_sbatch.sh`, poll for completion, read results, and keep/discard — in a loop.
+
+**To stop:** `Ctrl+C`, then `scancel <job_id>` if a SLURM job is still running.
+
+#### Option B: SLURM job (survives disconnect)
+
+Claude runs inside a SLURM job with direct GPU access. You can log off and it keeps running. Good for overnight runs.
+
+```bash
+cd ~/Projects/autoresearch-agents/mar23-1
+ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=1 TIME=0-08:00:00 ./make_sbatch.sh
+```
+
+Claude launches inside the SLURM job, runs `python train.py` directly (no nested sbatch), and loops autonomously for the duration of the time allocation.
+
+**To stop:** `scancel <job_id>`
+
+**To monitor:** Check the SLURM log, wandb dashboard, or the shared results file:
+```bash
+# SLURM output
+tail -f ~/Projects/autoresearch-agents/mar23-1/output/train/agent_*.out
+
+# Shared results (all agents)
+cat /lustre/.../autoresearch/shared/mar23/results.tsv
+
+# Wandb
+# Runs are logged to the "autoresearch" project
+```
+
+### Mixing modes
+
+You can run some agents interactively and others in SLURM simultaneously:
+
+```bash
+# Agent 0: interactive on login node
+cd ~/Projects/autoresearch-agents/mar23-0 && claude --dangerously-skip-permissions
+
+# Agent 1: fire-and-forget SLURM job
+cd ~/Projects/autoresearch-agents/mar23-1
+ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=1 TIME=0-12:00:00 ./make_sbatch.sh
+
+# Agent 2: another SLURM job
+cd ~/Projects/autoresearch-agents/mar23-2
+ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=2 TIME=0-12:00:00 ./make_sbatch.sh
+```
+
+All three share `results.tsv` and `directions.md` on lustre, so they coordinate to avoid duplicating experiments.
 
 ## Results
 
@@ -93,6 +154,8 @@ b2c3d4e	0.011200	7.9	keep	increase beta to 0.01
 c3d4e5f	0.013000	7.8	discard	switch to MLP predictor
 ```
 
+The shared file on lustre has an extra `agent` column so you can see which agent tried what.
+
 ### Analysis
 
 Open `analysis.ipynb` to visualize experiment progress:
@@ -103,22 +166,32 @@ jupyter notebook analysis.ipynb
 
 This generates `progress.png` showing the improvement frontier over time.
 
+### Wandb
+
+Training runs are logged to the `autoresearch` wandb project (if wandb is installed). Each run tracks:
+- Per-step: loss components (recon, KL, latent pred)
+- Final: val_dt_score, per-dt MSE breakdown, VRAM usage
+- Config: all hyperparameters, git hash, branch name
+
 ## Design choices
 
 - **Single file to modify.** The agent only touches `train.py`. Keeps scope manageable and diffs reviewable.
 - **Fixed time budget (15 min).** Experiments are directly comparable regardless of architecture changes. ODE predictors get fewer steps but the same wall-clock time.
 - **dt generalization metric.** Unlike reconstruction loss, this measures what matters: can the model predict dynamics at rates it wasn't trained on?
 - **Physics-informed starting point.** The baseline uses a Hamiltonian predictor because the research question is about physics-informed architectures. The agent can try simpler predictors to establish baselines.
-- **Self-contained.** No Hydra configs, no wandb, no distributed training. One GPU, one file, one metric.
+- **Git worktrees for isolation.** Each agent gets its own working directory and branch. No conflicts between agents or with the human's main checkout.
+- **Shared coordination files.** Agents read a shared results log before each experiment to avoid duplicating work. Advisory, not enforced — simple and robust.
 
 ## Project structure
 
 ```
-prepare.py      — data loading, environment, evaluation harness (read-only)
-train.py        — model architecture, predictors, training loop (agent modifies)
-program.md      — agent instructions (human modifies)
-results.tsv     — experiment log (untracked)
-run.log         — latest run output (untracked)
-analysis.ipynb  — visualization notebook
-pyproject.toml  — dependencies (informational)
+prepare.py        — data loading, environment, evaluation harness (read-only)
+train.py          — model architecture, predictors, training loop (agent modifies)
+program.md        — agent instructions (human modifies)
+setup_agent.sh    — create a worktree for a new agent
+make_sbatch.sh    — submit SLURM jobs (MODE=train or MODE=agent)
+results.tsv       — experiment log (untracked)
+run.log           — latest run output (untracked)
+analysis.ipynb    — visualization notebook
+pyproject.toml    — dependencies (informational)
 ```
