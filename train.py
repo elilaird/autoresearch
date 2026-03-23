@@ -13,12 +13,19 @@ transfer across different sampling rates (dt=0.1, 0.2, 0.5).
 """
 
 import math
+import os
 import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchdiffeq import odeint
+
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
 
 from prepare import (
     TIME_BUDGET,
@@ -59,6 +66,10 @@ BACKBONE_NHEAD = 4          # transformer attention heads
 BATCH_SIZE = 32
 LR = 1.5e-4
 SEED = 42
+
+# Logging
+WANDB_PROJECT = "autoresearch"
+WANDB_ENABLED = HAS_WANDB and os.environ.get("WANDB_DISABLED", "").lower() != "true"
 
 # ---------------------------------------------------------------------------
 # Building blocks
@@ -696,6 +707,56 @@ print(f"Data loaded. Train batches: {len(train_loader)}, Val batches: {len(val_l
 print(f"Time budget: {TIME_BUDGET}s")
 
 # ---------------------------------------------------------------------------
+# Wandb
+# ---------------------------------------------------------------------------
+
+if WANDB_ENABLED:
+    # Get git info for run name
+    import subprocess
+    try:
+        git_hash = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        git_branch = subprocess.check_output(
+            ["git", "branch", "--show-current"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        git_hash = "unknown"
+        git_branch = "unknown"
+
+    wandb.init(
+        project=WANDB_PROJECT,
+        name=f"{PREDICTOR_TYPE}/{BACKBONE or 'none'}/{git_hash}",
+        tags=[PREDICTOR_TYPE, BACKBONE or "no-backbone", git_branch],
+        config={
+            "latent_channels": LATENT_CHANNELS,
+            "hidden_channels": HIDDEN_CHANNELS,
+            "beta": BETA,
+            "free_bits": FREE_BITS,
+            "context_length": CONTEXT_LENGTH,
+            "pred_length": PRED_LENGTH,
+            "latent_pred_weight": LATENT_PRED_WEIGHT,
+            "encoder_frames": ENCODER_FRAMES,
+            "predictor_type": PREDICTOR_TYPE,
+            "predictor_hidden": PREDICTOR_HIDDEN,
+            "action_embedding_dim": ACTION_EMBEDDING_DIM,
+            "integration_dt": INTEGRATION_DT,
+            "integration_method": INTEGRATION_METHOD,
+            "damping_init": DAMPING_INIT,
+            "backbone": BACKBONE,
+            "backbone_layers": BACKBONE_LAYERS,
+            "backbone_nhead": BACKBONE_NHEAD,
+            "batch_size": BATCH_SIZE,
+            "lr": LR,
+            "seed": SEED,
+            "num_params_M": num_params / 1e6,
+            "git_hash": git_hash,
+            "git_branch": git_branch,
+        },
+    )
+    print(f"Wandb run: {wandb.run.url}")
+
+# ---------------------------------------------------------------------------
 # Training loop (time-budgeted)
 # ---------------------------------------------------------------------------
 
@@ -738,6 +799,16 @@ while True:
 
         progress = min(total_training_time / TIME_BUDGET, 1.0)
         remaining = max(0, TIME_BUDGET - total_training_time)
+
+        if WANDB_ENABLED:
+            wandb.log({
+                "train/total_loss": train_loss,
+                "train/recon_loss": losses["recon_loss"],
+                "train/kl_loss": losses["kl_loss"],
+                "train/latent_pred_loss": losses["latent_pred_loss"],
+                "train/smooth_loss": debiased_loss,
+                "progress": progress,
+            }, step=step)
 
         if step % 50 == 0:
             print(
@@ -798,3 +869,18 @@ print(f"num_steps:         {step}")
 print(f"num_params_M:      {num_params / 1e6:.1f}")
 print(f"predictor_type:    {PREDICTOR_TYPE}")
 print(f"backbone:          {BACKBONE}")
+
+if WANDB_ENABLED:
+    summary = {
+        "val/dt_score": val_dt_score,
+        "val/recon_loss": val_metrics["val_recon_loss"],
+        "val/kl_loss": val_metrics["val_kl_loss"],
+        "val/latent_pred_loss": val_metrics["val_latent_pred_loss"],
+        "peak_vram_mb": peak_vram_mb,
+        "num_epochs": epoch,
+        "num_steps": step,
+    }
+    for dt_val, mse in dt_breakdown.items():
+        summary[f"val/dt_{dt_val}_mse"] = mse
+    wandb.log(summary, step=step)
+    wandb.finish()
