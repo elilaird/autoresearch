@@ -24,7 +24,7 @@ from torchdiffeq import odeint
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-TIME_BUDGET = 900  # training time budget in seconds (15 minutes)
+TIME_BUDGET = int(os.environ.get("TIME_BUDGET", 900))  # default 15 minutes
 
 DATA_ROOT = os.environ.get(
     "DATA_ROOT",

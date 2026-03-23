@@ -57,62 +57,29 @@ python prepare.py  # should find oscillator_visual_60k_dt20Hz/
 
 ## Running agents
 
-Each agent runs in its own **git worktree** — an isolated copy of the repo on its own branch. Your main checkout is never touched.
+Each agent runs in its own **git worktree** — an isolated copy of the repo on its own branch. Your main checkout is never touched. A single script `run_agent.sh` handles worktree creation and launch.
 
-### Step 1: Create worktrees
-
-From the main autoresearch checkout, create one worktree per agent:
+#### Option A: Interactive on login node (requires active session)
 
 ```bash
-TAG=mar23 AGENT=0 ./setup_agent.sh
-TAG=mar23 AGENT=1 ./setup_agent.sh
-TAG=mar23 AGENT=2 ./setup_agent.sh
+TAG=mar23 AGENT=0 ./run_agent.sh
 ```
 
-This creates:
-- `~/Projects/autoresearch-agents/mar23-0/` on branch `autoresearch/mar23-0`
-- `~/Projects/autoresearch-agents/mar23-1/` on branch `autoresearch/mar23-1`
-- `~/Projects/autoresearch-agents/mar23-2/` on branch `autoresearch/mar23-2`
-- Shared coordination dir on lustre: `/lustre/.../autoresearch/shared/mar23/`
-
-### Step 2: Start agents
-
-Two options. You can mix them freely — all agents share the same `results.tsv` and `directions.md` on lustre, so no work is duplicated regardless of mode.
-
-#### Option A: Login node (requires active session)
-
-You stay connected. Claude runs on the login node and submits SLURM jobs for each training run. Good for watching progress interactively.
-
-```bash
-cd ~/Projects/autoresearch-agents/mar23-0
-claude --dangerously-skip-permissions
-```
-
-Then tell Claude:
-```
-Read program.md and start the experiment loop. Tag=mar23, Agent=0.
-Shared dir: /lustre/.../autoresearch/shared/mar23
-Do not ask me any questions. Run autonomously until I stop you.
-```
-
-Claude will edit `train.py`, submit SLURM jobs via `make_sbatch.sh`, poll for completion, read results, and keep/discard — in a loop.
+Creates worktree at `~/Projects/autoresearch-agents/mar23-0/`, then launches Claude Code interactively. Claude submits SLURM jobs for each training run and polls for results.
 
 **To stop:** `Ctrl+C`, then `scancel <job_id>` if a SLURM job is still running.
 
 #### Option B: SLURM job (survives disconnect)
 
-Claude runs inside a SLURM job with direct GPU access. You can log off and it keeps running. Good for overnight runs.
-
 ```bash
-cd ~/Projects/autoresearch-agents/mar23-1
-ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=1 TIME=0-08:00:00 ./make_sbatch.sh
+TAG=mar23 AGENT=1 MODE=agent ANTHROPIC_API_KEY=sk-... TIME=0-12:00:00 ./run_agent.sh
 ```
 
-Claude launches inside the SLURM job, runs `python train.py` directly (no nested sbatch), and loops autonomously for the duration of the time allocation.
+Creates worktree, then submits a SLURM job where Claude runs with direct GPU access. You can log off — it keeps running.
 
 **To stop:** `scancel <job_id>`
 
-**To monitor:** Check the SLURM log, wandb dashboard, or the shared results file:
+**To monitor:**
 ```bash
 # SLURM output
 tail -f ~/Projects/autoresearch-agents/mar23-1/output/train/agent_*.out
@@ -120,28 +87,23 @@ tail -f ~/Projects/autoresearch-agents/mar23-1/output/train/agent_*.out
 # Shared results (all agents)
 cat /lustre/.../autoresearch/shared/mar23/results.tsv
 
-# Wandb
-# Runs are logged to the "autoresearch" project
+# Wandb — runs are logged to the "autoresearch" project
 ```
 
-### Mixing modes
+#### Mixing modes
 
-You can run some agents interactively and others in SLURM simultaneously:
+Run some agents interactively and others in SLURM — all share the same coordination files:
 
 ```bash
-# Agent 0: interactive on login node
-cd ~/Projects/autoresearch-agents/mar23-0 && claude --dangerously-skip-permissions
+# Agent 0: interactive
+TAG=mar23 AGENT=0 ./run_agent.sh
 
-# Agent 1: fire-and-forget SLURM job
-cd ~/Projects/autoresearch-agents/mar23-1
-ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=1 TIME=0-12:00:00 ./make_sbatch.sh
-
-# Agent 2: another SLURM job
-cd ~/Projects/autoresearch-agents/mar23-2
-ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=2 TIME=0-12:00:00 ./make_sbatch.sh
+# Agent 1 & 2: fire-and-forget SLURM jobs
+TAG=mar23 AGENT=1 MODE=agent ANTHROPIC_API_KEY=sk-... TIME=0-12:00:00 ./run_agent.sh
+TAG=mar23 AGENT=2 MODE=agent ANTHROPIC_API_KEY=sk-... TIME=0-12:00:00 ./run_agent.sh
 ```
 
-All three share `results.tsv` and `directions.md` on lustre, so they coordinate to avoid duplicating experiments.
+All agents share `results.tsv` and `directions.md` on lustre, so they coordinate to avoid duplicating experiments.
 
 ## Results
 
@@ -188,8 +150,7 @@ Training runs are logged to the `autoresearch` wandb project (if wandb is instal
 prepare.py        — data loading, environment, evaluation harness (read-only)
 train.py          — model architecture, predictors, training loop (agent modifies)
 program.md        — agent instructions (human modifies)
-setup_agent.sh    — create a worktree for a new agent
-make_sbatch.sh    — submit SLURM jobs (MODE=train or MODE=agent)
+run_agent.sh      — create worktree + launch agent (interactive or SLURM)
 results.tsv       — experiment log (untracked)
 run.log           — latest run output (untracked)
 analysis.ipynb    — visualization notebook

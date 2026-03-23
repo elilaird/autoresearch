@@ -63,6 +63,8 @@ Each experiment runs on a single GPU via SLURM. The training script runs for a *
 
 **The goal is simple: get the lowest val_dt_score.** This is the average latent MSE across dt generalization tests at dt=[0.1, 0.2, 0.5]. Since the time budget is fixed, you don't need to worry about training time — it's always 15 minutes. Everything is fair game: change the predictor type, the backbone, the encoder, the decoder, the optimizer, the hyperparameters, the integration method, the loss function. The only constraint is that the code runs without crashing and finishes within the time budget.
 
+**Time budget**: The default is 15 minutes. If a run is too short to show any learning signal — loss hasn't started decreasing, or the model hasn't completed enough epochs to reveal a trend — you may increase it by setting `TIME_BUDGET` in `train.py` (the constant imported from `prepare.py` is overridable via env var: `TIME_BUDGET=1800 python train.py`). **Only increase it enough to see whether a direction is working** — you are not trying to fully train the model, just get enough signal to decide keep/discard. Going from 15 to 20-30 minutes is fine if justified. Going to hours is not — that defeats the purpose of fast iteration. If a direction needs hours to show signal, it's probably not a good direction. When comparing results across different time budgets, note the time in your results description.
+
 **VRAM** is a soft constraint. Some increase is acceptable for meaningful val_dt_score gains, but it should not blow up dramatically.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude.
@@ -172,7 +174,7 @@ LOOP FOREVER:
 
    **Mode A (login node — no GPU):**
    ```bash
-   TAG=<tag> ./make_sbatch.sh 2>&1
+   TAG=<tag> MODE=train ./run_agent.sh 2>&1
    ```
    Parse the output for `SUBMITTED_JOB_ID=<id>` and `LOG_PATH=<path>`. Then poll every 60 seconds:
    ```bash
@@ -184,7 +186,7 @@ LOOP FOREVER:
    ```bash
    python train.py > run.log 2>&1
    ```
-   Do NOT use `make_sbatch.sh`. You already have GPU access.
+   Do NOT use `run_agent.sh`. You already have GPU access.
 
 6. **Read results**:
    ```bash
@@ -197,6 +199,12 @@ LOOP FOREVER:
 11. **(If multi-agent) Update shared findings** if you discovered something noteworthy.
 12. Go back to step 1.
 
+**Notes**: You have a personal notes directory at `$AUTORESEARCH_NOTES_DIR` (on lustre). Use it to record your thinking, hypotheses, observations, and analysis. Write notes as markdown files — for example:
+- `notes.md` — running log of what you've tried and why, observations, hypotheses for next steps
+- `analysis.md` — deeper analysis of patterns you're seeing across experiments
+
+Write notes after each experiment. These help the human understand your reasoning and help other agents learn from your discoveries. Be concise but capture the "why" — what made you try this, what surprised you, what you'd try next.
+
 **Crashes**: Use your judgment. If it's a typo or easy fix, fix and resubmit. If the idea is fundamentally broken, skip it, log "crash", and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the architecture, try combining previous near-misses, try more radical changes. The loop runs until the human interrupts you, period.
@@ -207,24 +215,21 @@ As an example use case, a user might leave you running while they sleep. Each ex
 
 Multiple Claude Code sessions can run in parallel on the login node, each in its own **git worktree** with its own branch (`autoresearch/<tag>-0`, `autoresearch/<tag>-1`, etc.). Worktrees share the same `.git` directory but have independent working directories, so agents never conflict with each other or the human's main checkout.
 
-**Setup** (done by the human before starting agents):
+**Setup** (done by the human — `run_agent.sh` handles worktree creation and launch in one step):
 ```bash
 # From the main autoresearch checkout:
-TAG=mar23 AGENT=0 ./setup_agent.sh
-TAG=mar23 AGENT=1 ./setup_agent.sh
-TAG=mar23 AGENT=2 ./setup_agent.sh
 
-# Mode A: start Claude on login node (requires active session)
-cd ~/Projects/autoresearch-agents/mar23-0 && claude --dangerously-skip-permissions
+# Mode A: interactive on login node
+TAG=mar23 AGENT=0 ./run_agent.sh
 
-# Mode B: submit Claude as SLURM job (survives disconnect)
-cd ~/Projects/autoresearch-agents/mar23-1 && ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=1 ./make_sbatch.sh
-cd ~/Projects/autoresearch-agents/mar23-2 && ANTHROPIC_API_KEY=sk-... TAG=mar23 MODE=agent AGENT=2 ./make_sbatch.sh
+# Mode B: autonomous SLURM jobs (survives disconnect)
+TAG=mar23 AGENT=1 MODE=agent ANTHROPIC_API_KEY=sk-... ./run_agent.sh
+TAG=mar23 AGENT=2 MODE=agent ANTHROPIC_API_KEY=sk-... ./run_agent.sh
 
 # Mix freely — all agents share the same results.tsv and directions.md
 ```
 
-**Shared directory**: Created by `setup_agent.sh` on lustre at `/lustre/.../autoresearch/shared/<tag>/`. The human will tell you the path.
+**Shared directory**: Created by `run_agent.sh` on lustre at `/lustre/.../autoresearch/shared/<tag>/`. The human will tell you the path.
 
 **Shared files**:
 
