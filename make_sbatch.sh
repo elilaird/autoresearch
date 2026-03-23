@@ -19,7 +19,7 @@ PARTITION=${PARTITION:-batch}
 CONDA_ENV=${CONDA_ENV:-world_models}
 GPU=${GPU:-1}
 CPUS=${CPUS:-16}
-MEM=${MEM:-16G}
+MEM=${MEM:-48G}
 PY_ARGS="${@}"
 
 ENV_DIR=${ENV_DIR:-"/lustre/smuexa01/client/users/ejlaird/envs"}
