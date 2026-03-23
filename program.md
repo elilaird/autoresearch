@@ -2,7 +2,7 @@
 
 This is an experiment to have the LLM do its own research on physics world model architectures.
 
-**IMPORTANT**: In the autoresearch context, you MUST run Python commands to execute experiments. This overrides the main CLAUDE.md instruction "Do NOT run any Python commands." The entire point of autoresearch is autonomous experimentation.
+**IMPORTANT**: In the autoresearch context, you MUST run shell commands to submit and monitor SLURM jobs. This overrides the main CLAUDE.md instruction "Do NOT run any Python commands." The entire point of autoresearch is autonomous experimentation.
 
 ## Background
 
@@ -10,24 +10,37 @@ This project learns physics dynamics from visual observations (64×64 rendered o
 
 The **core research question** is: which predictor architecture generalizes best across different sampling rates (dt)? The model trains on dt=0.2 data but is evaluated on dt=0.1 (interpolation) and dt=0.5 (extrapolation). Physics-informed predictors (Hamiltonian, Newtonian) should theoretically generalize better than learned dynamics (MLP, LSTM) because they encode the structure of physical laws.
 
+## How it works
+
+You (the Claude Code agent) run **on the login node** in an **isolated git worktree** — your own copy of the repo on your own branch. The human's main checkout is untouched. You do NOT have a GPU. Instead, you:
+1. Edit `train.py` in your worktree
+2. Submit it as a SLURM job via `TAG=<tag> ./make_sbatch.sh` (runs on a GPU node)
+3. Poll for job completion via `squeue`
+4. Read the output log to extract results
+5. Keep or discard the change, then repeat
+
+Each training run takes ~17 minutes (15 min training + eval). While a job is running, you wait — do NOT submit another job. One experiment at a time.
+
 ## Setup
 
-To set up a new experiment, work with the user to:
+The human sets up your worktree before starting you. You should already be running inside it. Verify by checking `git branch --show-current` — it should be `autoresearch/<tag>-<agent_id>`.
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar22`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current HEAD.
-3. **Read the in-scope files**: Read these files for full context:
+To set up the experiment:
+
+1. **Identify your tag and agent ID**: The human will tell you, or check your branch name (format: `autoresearch/<tag>-<agent_id>`).
+2. **Read the in-scope files**: Read these files for full context:
    - `prepare.py` — fixed constants, data loading, environment, evaluation harness. Do not modify.
    - `train.py` — the file you modify. Model architecture, predictors, optimizer, training loop.
-4. **Verify data exists**: Check that the dataset path printed by `python prepare.py` shows valid data. If not, tell the human.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+3. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
+4. **Check shared coordination files** (if multi-agent): The human will give you the shared directory path. Read the shared directions and results to understand what other agents have already tried or claimed.
+5. **Claim your direction** (if multi-agent): Write your intended exploration direction to the shared `directions.md` file before starting.
 6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 15 minutes** (wall clock training time, excluding startup/evaluation). You launch it simply as: `python train.py`
+Each experiment runs on a single GPU via SLURM. The training script runs for a **fixed time budget of 15 minutes** (wall clock training time, excluding startup/evaluation).
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: predictor type, predictor architecture, encoder/decoder architecture, temporal backbone, optimizer, hyperparameters, training loop, loss weights, integration method, etc.
@@ -105,22 +118,19 @@ predictor_type:    hamiltonian
 backbone:          transformer
 ```
 
-You can extract the key metric from the log file:
-
-```
-grep "^val_dt_score:\|^peak_vram_mb:" run.log
-```
-
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+When an experiment is done, log it to your local `results.tsv` (and the shared one if multi-agent).
 
-The TSV has a header row and 5 columns:
+Tab-separated (NOT comma-separated — commas break in descriptions).
+
+**Local results.tsv** has 5 columns:
 
 ```
 commit	val_dt_score	memory_gb	status	description
 ```
 
+Column definitions:
 1. git commit hash (short, 7 chars)
 2. val_dt_score achieved (e.g. 0.012345) — use 0.000000 for crashes
 3. peak memory in GB, round to .1f (divide peak_vram_mb by 1024) — use 0.0 for crashes
@@ -139,26 +149,81 @@ d4e5f6g	0.000000	0.0	crash	double latent channels (OOM)
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar22`).
+The experiment runs in your isolated worktree on a dedicated branch (e.g. `autoresearch/mar23-0`).
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `python train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_dt_score:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_dt_score improved (lower), you "advance" the branch, keeping the git commit
-9. If val_dt_score is equal or worse, you git reset back to where you started
+1. Look at the git state: the current branch/commit we're on.
+2. **(If multi-agent) Check shared state**: Read shared results and directions to avoid duplicating work.
+3. Decide on an experimental idea. Edit `train.py` with the change.
+4. `git commit` the change.
+5. **Submit the SLURM job**:
+   ```bash
+   TAG=<tag> ./make_sbatch.sh 2>&1
+   ```
+   Parse the output for `SUBMITTED_JOB_ID=<id>` and `LOG_PATH=<path>`.
+6. **Poll for completion** (check every 60 seconds):
+   ```bash
+   squeue -j <job_id> -h -o "%T" 2>/dev/null
+   ```
+   - If output is `RUNNING` or `PENDING` → keep waiting.
+   - If output is empty (job no longer in queue) → job finished. Proceed.
+   - **Do NOT poll more often than every 60 seconds.** The job takes ~17 minutes.
+7. **Read results** from the log file:
+   ```bash
+   grep "^val_dt_score:\|^peak_vram_mb:" <log_path>
+   ```
+8. If grep is empty → the run crashed. Read `tail -n 50 <log_path>` for the error. Attempt a fix or skip.
+9. Record results in `results.tsv` (and shared file if multi-agent). Do NOT commit results files.
+10. If val_dt_score improved (lower than your current best) → **keep** the git commit, advance the branch.
+11. If val_dt_score is equal or worse → **discard**: `git reset --hard HEAD~1`.
+12. **(If multi-agent) Update shared findings** if you discovered something noteworthy.
+13. Go back to step 1.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+**Timeout**: If a job hasn't completed after 30 minutes of polling, cancel it (`scancel <job_id>`), treat it as a crash, and revert.
 
-**Timeout**: Each experiment should take ~17 minutes total (15 min training + eval overhead). If a run exceeds 25 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+**Crashes**: Use your judgment. If it's a typo or easy fix, fix and resubmit. If the idea is fundamentally broken, skip it, log "crash", and move on.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — re-read the architecture, try combining previous near-misses, try more radical changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. Each experiment takes ~17 minutes so you can run approx 3-4/hour, for a total of about 30 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+As an example use case, a user might leave you running while they sleep. Each experiment takes ~17 minutes of SLURM time (plus queue wait), so you can run approx 3-4/hour. The user then wakes up to experimental results, all completed by you while they slept!
+
+## Multi-agent coordination
+
+Multiple Claude Code sessions can run in parallel on the login node, each in its own **git worktree** with its own branch (`autoresearch/<tag>-0`, `autoresearch/<tag>-1`, etc.). Worktrees share the same `.git` directory but have independent working directories, so agents never conflict with each other or the human's main checkout.
+
+**Setup** (done by the human before starting agents):
+```bash
+# From the main autoresearch checkout:
+TAG=mar23 AGENT=0 ./setup_agent.sh    # creates ~/Projects/autoresearch-agents/mar23-0/
+TAG=mar23 AGENT=1 ./setup_agent.sh    # creates ~/Projects/autoresearch-agents/mar23-1/
+TAG=mar23 AGENT=2 ./setup_agent.sh    # creates ~/Projects/autoresearch-agents/mar23-2/
+
+# Then start a Claude Code session in each:
+cd ~/Projects/autoresearch-agents/mar23-0 && claude
+cd ~/Projects/autoresearch-agents/mar23-1 && claude
+cd ~/Projects/autoresearch-agents/mar23-2 && claude
+```
+
+**Shared directory**: Created by `setup_agent.sh` on lustre at `/lustre/.../autoresearch/shared/<tag>/`. The human will tell you the path.
+
+**Shared files**:
+
+1. **`results.tsv`** — combined results from ALL agents. Same format as local but with an extra `agent` column:
+   ```
+   agent	commit	val_dt_score	memory_gb	status	description
+   ```
+   **Always append** to this file after each experiment. Read it before starting a new experiment to see what's been tried.
+
+2. **`directions.md`** — claimed research directions and key findings. Before starting a new line of exploration:
+   - Read the file to see what directions other agents have claimed
+   - Add your own claimed direction under "Claimed directions"
+   - After discovering something important, add it under "Key findings"
+
+**Rules for multi-agent coordination**:
+- **Read before you write**: Always check shared results before designing your next experiment.
+- **Don't repeat**: If another agent already tried an idea (check shared results.tsv), skip it and try something different.
+- **Claim your lane**: Each agent should focus on a different area of the search space. If one agent is sweeping beta values, another should explore predictor types or architecture changes.
+- **Share discoveries**: If you find that something works surprisingly well (or badly), log it in shared directions.md so other agents can build on (or avoid) your finding.
+- **Append only**: Never overwrite or delete lines from the shared files. Only append.
+- **No locking needed**: Each agent appends single lines atomically. Minor race conditions are acceptable — the information is advisory, not authoritative.
