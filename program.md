@@ -61,11 +61,11 @@ Each experiment runs on a single GPU via SLURM. The training script runs for a *
 - Install new packages or add dependencies. You can only use what's already available in the conda environment (`world_models`).
 - Modify the evaluation harness. The `evaluate_dt_generalization` function in `prepare.py` is the ground truth metric.
 
-**The goal is simple: get the lowest val_dt_score.** This is the average latent MSE across dt generalization tests at dt=[0.1, 0.2, 0.5]. Since the time budget is fixed, you don't need to worry about training time — it's always 15 minutes. Everything is fair game: change the predictor type, the backbone, the encoder, the decoder, the optimizer, the hyperparameters, the integration method, the loss function. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the lowest combined val_recon_loss + val_latent_pred.** These two metrics measure reconstruction quality and latent-space prediction accuracy respectively. Since the time budget is fixed, you don't need to worry about training time — it's always 15 minutes. Everything is fair game: change the predictor type, the backbone, the encoder, the decoder, the optimizer, the hyperparameters, the integration method, the loss function. The only constraint is that the code runs without crashing and finishes within the time budget.
 
 **Time budget**: The default is 15 minutes. If a run is too short to show any learning signal — loss hasn't started decreasing, or the model hasn't completed enough epochs to reveal a trend — you may increase it by setting `TIME_BUDGET` in `train.py` (the constant imported from `prepare.py` is overridable via env var: `TIME_BUDGET=1800 python train.py`). **Only increase it enough to see whether a direction is working** — you are not trying to fully train the model, just get enough signal to decide keep/discard. Going from 15 to 20-30 minutes is fine if justified. Going to hours is not — that defeats the purpose of fast iteration. If a direction needs hours to show signal, it's probably not a good direction. When comparing results across different time budgets, note the time in your results description.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_dt_score gains, but it should not blow up dramatically.
+**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_recon_loss + val_latent_pred gains, but it should not blow up dramatically.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude.
 
@@ -140,24 +140,26 @@ Tab-separated (NOT comma-separated — commas break in descriptions).
 **Local results.tsv** has 5 columns:
 
 ```
-commit	val_dt_score	memory_gb	status	description
+commit	val_recon_loss	val_latent_pred	combined_score	memory_gb	status	description
 ```
 
 Column definitions:
 1. git commit hash (short, 7 chars)
-2. val_dt_score achieved (e.g. 0.012345) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+2. val_recon_loss achieved (e.g. 0.001234) — use 0.000000 for crashes
+3. val_latent_pred achieved (e.g. 0.004567) — use 0.000000 for crashes
+4. combined_score = val_recon_loss + val_latent_pred (e.g. 0.005801) — use 0.000000 for crashes
+5. peak memory in GB, round to .1f (divide peak_vram_mb by 1024) — use 0.0 for crashes
+6. status: `keep`, `discard`, or `crash`
+7. short text description of what this experiment tried
 
 Example:
 
 ```
-commit	val_dt_score	memory_gb	status	description
-a1b2c3d	0.012345	7.9	keep	baseline (hamiltonian + transformer)
-b2c3d4e	0.011200	7.9	keep	increase beta to 0.01
-c3d4e5f	0.013000	7.8	discard	switch to MLP predictor
-d4e5f6g	0.000000	0.0	crash	double latent channels (OOM)
+commit	val_recon_loss	val_latent_pred	combined_score	memory_gb	status	description
+a1b2c3d	0.001234	0.004567	0.005801	7.9	keep	baseline (hamiltonian + transformer)
+b2c3d4e	0.001100	0.004200	0.005300	7.9	keep	increase beta to 0.01
+c3d4e5f	0.001500	0.005000	0.006500	7.8	discard	switch to MLP predictor
+d4e5f6g	0.000000	0.000000	0.000000	0.0	crash	double latent channels (OOM)
 ```
 
 ## The experiment loop
@@ -190,12 +192,12 @@ LOOP FOREVER:
 
 6. **Read results**:
    ```bash
-   grep "^val_dt_score:\|^peak_vram_mb:" <log_path_or_run.log>
+   grep "^val_recon_loss:\|^val_latent_pred:\|^peak_vram_mb:" <log_path_or_run.log>
    ```
 7. If grep is empty → the run crashed. Read `tail -n 50 <log>` for the error. Attempt a fix or skip.
 8. Record results in `results.tsv` (and shared file if multi-agent). Do NOT commit results files.
-9. If val_dt_score improved (lower than your current best) → **keep** the git commit, advance the branch.
-10. If val_dt_score is equal or worse → **discard**: `git reset --hard HEAD~1`.
+9. If combined_score (val_recon_loss + val_latent_pred) improved (lower than your current best) → **keep** the git commit, advance the branch.
+10. If combined_score is equal or worse → **discard**: `git reset --hard HEAD~1`.
 11. **(If multi-agent) Update shared findings** if you discovered something noteworthy.
 12. Go back to step 1.
 
@@ -235,7 +237,7 @@ TAG=mar23 AGENT=2 MODE=agent ANTHROPIC_API_KEY=sk-... ./run_agent.sh
 
 1. **`results.tsv`** — combined results from ALL agents. Same format as local but with an extra `agent` column:
    ```
-   agent	commit	val_dt_score	memory_gb	status	description
+   agent	commit	val_recon_loss	val_latent_pred	combined_score	memory_gb	status	description
    ```
    **Always append** to this file after each experiment. Read it before starting a new experiment to see what's been tried.
 
