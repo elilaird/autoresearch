@@ -20,8 +20,9 @@
 #   TAG=mar23 AGENT=0 MODE=session ./run_agent.sh
 #   TAG=mar23 AGENT=1 MODE=session ./run_agent.sh
 #
-#   # Submit a single training run from an existing worktree (used by login-node agents)
+#   # Submit a single training run from an existing worktree (used by session agents)
 #   TAG=mar23 MODE=train ./run_agent.sh
+#   # Training runs use TRAIN_PARTITION (default: short) — faster to schedule than batch
 
 set -e
 
@@ -29,7 +30,8 @@ TAG=${TAG:?"ERROR: TAG is required. Usage: TAG=mar23 AGENT=0 ./run_agent.sh"}
 AGENT=${AGENT:-0}
 MODE=${MODE:-interactive}  # interactive, agent, train, or session
 
-PARTITION=${PARTITION:-batch}
+PARTITION=${PARTITION:-batch}        # partition for session/agent jobs (long-running)
+TRAIN_PARTITION=${TRAIN_PARTITION:-short}  # partition for training runs (short, easier to get)
 CONDA_ENV=${CONDA_ENV:-world_models}
 GPU=${GPU:-1}
 CPUS=${CPUS:-16}
@@ -231,7 +233,7 @@ elif [ "${MODE}" = "train" ]; then
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:${GPU}
 #SBATCH --time=${TIME}
-#SBATCH --partition=${PARTITION}
+#SBATCH --partition=${TRAIN_PARTITION}
 #SBATCH --tasks-per-node=1
 
 module purge
