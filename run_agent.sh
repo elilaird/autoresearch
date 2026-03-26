@@ -16,6 +16,10 @@
 #   TAG=mar23 AGENT=1 MODE=agent ANTHROPIC_API_KEY=sk-... TIME=0-12:00:00 ./run_agent.sh
 #   TAG=mar23 AGENT=2 MODE=agent ANTHROPIC_API_KEY=sk-... TIME=0-12:00:00 ./run_agent.sh
 #
+#   # Option C: Interactive session on a compute node (SSH in after job starts)
+#   TAG=mar23 AGENT=0 MODE=session ./run_agent.sh
+#   TAG=mar23 AGENT=1 MODE=session ./run_agent.sh
+#
 #   # Submit a single training run from an existing worktree (used by login-node agents)
 #   TAG=mar23 MODE=train ./run_agent.sh
 
@@ -23,7 +27,7 @@ set -e
 
 TAG=${TAG:?"ERROR: TAG is required. Usage: TAG=mar23 AGENT=0 ./run_agent.sh"}
 AGENT=${AGENT:-0}
-MODE=${MODE:-interactive}  # interactive, agent, or train
+MODE=${MODE:-interactive}  # interactive, agent, train, or session
 
 PARTITION=${PARTITION:-batch}
 CONDA_ENV=${CONDA_ENV:-world_models}
@@ -45,6 +49,8 @@ DATETIME=$(date +"%Y%m%d_%H%M%S")
 # Default time depends on mode
 if [ "${MODE}" = "agent" ]; then
     TIME=${TIME:-0-08:00:00}
+elif [ "${MODE}" = "session" ]; then
+    TIME=${TIME:-2-00:00:00}
 else
     TIME=${TIME:-0-01:00:00}
 fi
@@ -113,6 +119,8 @@ fi
 
 if [ "${MODE}" = "interactive" ]; then
     # Option A: Start Claude Code interactively on login node
+    PROMPT="Read program.md and start the experiment loop. Tag=${TAG}, Agent=${AGENT}. Shared dir: ${SHARED_DIR}. Notes dir: ${NOTES_DIR}. Do not ask me any questions. Run autonomously until I stop you."
+
     echo ""
     echo "=== AGENT READY ==="
     echo "WORKTREE: ${WORKTREE_DIR}"
@@ -120,12 +128,15 @@ if [ "${MODE}" = "interactive" ]; then
     echo "SHARED:   ${SHARED_DIR}"
     echo "==================="
     echo ""
-    echo "Starting Claude Code session..."
+    echo "To start, cd into the worktree and launch Claude Code:"
     echo ""
-
-    cd ${WORKTREE_DIR}
-    exec claude --dangerously-skip-permissions -p \
-        "Read program.md and start the experiment loop. Tag=${TAG}, Agent=${AGENT}. Shared dir: ${SHARED_DIR}. Notes dir: ${SHARED_DIR}/agents/${AGENT}. Do not ask me any questions. Run autonomously until I stop you."
+    echo "  cd ${WORKTREE_DIR}"
+    echo "  export AUTORESEARCH_SHARED_DIR=\"${SHARED_DIR}\""
+    echo "  export AUTORESEARCH_AGENT_ID=\"${AGENT}\""
+    echo "  export AUTORESEARCH_TAG=\"${TAG}\""
+    echo "  export AUTORESEARCH_NOTES_DIR=\"${NOTES_DIR}\""
+    echo "  claude --dangerously-skip-permissions\"${PROMPT}\""
+    echo ""
 
 elif [ "${MODE}" = "agent" ]; then
     # Option B: Submit Claude Code as a SLURM job
@@ -177,7 +188,7 @@ echo "==========================="
 
 PROMPT="Read program.md and start the experiment loop. Tag=${TAG}, Agent=${AGENT}. Shared dir: ${SHARED_DIR}. Notes dir: ${SHARED_DIR}/agents/${AGENT}. Run autonomously — do not ask questions. You have direct GPU access — run python train.py directly, do NOT use run_agent.sh."
 
-claude --dangerously-skip-permissions --output-format=stream-json -p "\${PROMPT}" 2>&1
+claude --dangerously-skip-permissions -p "\${PROMPT}" 2>&1
 SBATCH_EOF
 
     SBATCH_OUTPUT=$(sbatch ${SBATCH_FILE} 2>&1)
@@ -260,7 +271,83 @@ SBATCH_EOF
 
     rm -f ${SBATCH_FILE}
 
+elif [ "${MODE}" = "session" ]; then
+    # Option C: Submit a keep-alive job; SSH in and run claude manually in tmux.
+    # The agent submits training runs via MODE=train and polls squeue for results.
+    LOG_PATH="${WORKTREE_DIR}/output/train/session_${DATETIME}.out"
+    SBATCH_FILE="${WORKTREE_DIR}/output/train/session_${DATETIME}.sbatch"
+
+    PROMPT="Read program.md and start the experiment loop. Tag=${TAG}, Agent=${AGENT}. Shared dir: ${SHARED_DIR}. Notes dir: ${NOTES_DIR}. Do not ask me any questions. Run autonomously until I stop you."
+
+    cat > ${SBATCH_FILE} << SBATCH_EOF
+#!/usr/bin/env zsh
+#SBATCH -J ar-${TAG}-a${AGENT}
+#SBATCH -A coreyc_coreyc_mp_jepa_0001
+#SBATCH -o ${LOG_PATH}
+#SBATCH --cpus-per-task=${CPUS}
+#SBATCH --mem=${MEM}
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:${GPU}
+#SBATCH --time=${TIME}
+#SBATCH --partition=${PARTITION}
+#SBATCH --tasks-per-node=1
+
+module purge
+module load conda
+module load gcc/11.2.0
+conda activate ${ENV_DIR}/${CONDA_ENV}
+
+sleep infinity
+SBATCH_EOF
+
+    SBATCH_OUTPUT=$(sbatch ${SBATCH_FILE} 2>&1)
+    JOB_ID=$(echo ${SBATCH_OUTPUT} | grep -oP '\d+$')
+
+    if [ -z "${JOB_ID}" ]; then
+        echo "ERROR: sbatch failed: ${SBATCH_OUTPUT}"
+        rm -f ${SBATCH_FILE}
+        exit 1
+    fi
+
+    rm -f ${SBATCH_FILE}
+
+    echo ""
+    echo "=== SESSION SUBMITTED ==="
+    echo "JOB_ID:   ${JOB_ID}"
+    echo "WORKTREE: ${WORKTREE_DIR}"
+    echo "BRANCH:   ${BRANCH}"
+    echo "SHARED:   ${SHARED_DIR}"
+    echo "TIME:     ${TIME}"
+    echo "LOG:      ${LOG_PATH}"
+    echo "========================="
+    echo ""
+    echo "Wait for job to start, then find your node:"
+    echo "  squeue -j ${JOB_ID} -h -o \"%N %T\""
+    echo ""
+    echo "SSH in and start tmux:"
+    echo "  ssh <node>"
+    echo "  tmux new -s ar-${TAG}-${AGENT}"
+    echo ""
+    echo "Set up environment and launch claude interactively:"
+    echo "  module purge && module load conda && module load gcc/11.2.0"
+    echo "  conda activate ${ENV_DIR}/${CONDA_ENV}"
+    echo "  cd ${WORKTREE_DIR}"
+    echo "  export AUTORESEARCH_SHARED_DIR=\"${SHARED_DIR}\""
+    echo "  export AUTORESEARCH_AGENT_ID=\"${AGENT}\""
+    echo "  export AUTORESEARCH_TAG=\"${TAG}\""
+    echo "  export AUTORESEARCH_NOTES_DIR=\"${NOTES_DIR}\""
+    echo "  claude --dangerously-skip-permissions"
+    echo ""
+    echo "When claude starts, paste this prompt:"
+    echo "  ${PROMPT}"
+    echo ""
+    echo "Reconnect later:"
+    echo "  ssh <node>"
+    echo "  tmux attach -t ar-${TAG}-${AGENT}"
+    echo ""
+    echo "Stop: scancel ${JOB_ID}"
+
 else
-    echo "ERROR: Unknown MODE=${MODE}. Use: interactive, agent, or train"
+    echo "ERROR: Unknown MODE=${MODE}. Use: interactive, agent, train, or session"
     exit 1
 fi
