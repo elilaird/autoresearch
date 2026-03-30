@@ -90,7 +90,7 @@ fi
 mkdir -p ${SHARED_DIR}
 
 if [ ! -f "${SHARED_DIR}/results.tsv" ]; then
-    printf "agent\tcommit\tval_dt_score\tmemory_gb\tstatus\tdescription\n" > "${SHARED_DIR}/results.tsv"
+    printf "agent\tcommit\tval_recon_loss\tval_latent_pred\tcombined_score\tmemory_gb\tstatus\tdescription\n" > "${SHARED_DIR}/results.tsv"
     echo "Created shared results: ${SHARED_DIR}/results.tsv"
 fi
 
@@ -177,6 +177,11 @@ export AUTORESEARCH_TAG="${TAG}"
 export AUTORESEARCH_NOTES_DIR="${SHARED_DIR}/agents/${AGENT}"
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"
 export PYTHONUNBUFFERED=1
+echo "AUTORESEARCH_SHARED_DIR=${SHARED_DIR}"
+echo "AUTORESEARCH_AGENT_ID=${AGENT}"
+echo "AUTORESEARCH_TAG=${TAG}"
+echo "AUTORESEARCH_NOTES_DIR=${SHARED_DIR}/agents/${AGENT}"
+
 
 echo "=== AUTORESEARCH AGENT ==="
 echo "TAG: ${TAG}"
