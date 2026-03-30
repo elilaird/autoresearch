@@ -110,7 +110,7 @@ After completing an experiment, log your findings here.
 <!-- Format: - agent <id>: <direction description> -->
 
 ## Key findings
-<!-- Format: - agent <id>: <finding> (commit <hash>, val_dt_score=<score>) -->
+<!-- Format: - agent <id>: <finding> (commit <hash>, combined=<score>) -->
 DIRECTIONS_EOF
     echo "Created shared directions: ${SHARED_DIR}/directions.md"
 fi

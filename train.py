@@ -8,6 +8,11 @@ Architecture: Beta-VAE visual world model with Hamiltonian predictor
 and Transformer temporal backbone. Learns physics dynamics in latent
 space from 64x64 rendered oscillator images.
 
+Now supports two training modes:
+- "hgn": Original beta-VAE ELBO (reconstruction + KL + latent prediction)
+- "jepa": LeWM-style JEPA (latent prediction + SIGReg anti-collapse)
+- "hybrid": JEPA core + lightweight reconstruction supervision
+
 The model is evaluated on dt generalization: how well learned dynamics
 transfer across different sampling rates (dt=0.1, 0.2, 0.5).
 """
@@ -41,15 +46,27 @@ from prepare import (
 # Hyperparameters (edit these directly)
 # ---------------------------------------------------------------------------
 
+# Training mode
+TRAINING_MODE = "hgn"           # "hgn", "jepa", or "hybrid"
+
 # Architecture
 LATENT_CHANNELS = 64        # total latent dim (split into position + momentum halves)
 HIDDEN_CHANNELS = 512       # hidden dim for encoder/decoder MLPs
-BETA = 0.003                # KL divergence weight
+BETA = 0.003                # KL divergence weight (HGN mode only)
 FREE_BITS = 0.0             # per-element KL floor (prevents posterior collapse)
 CONTEXT_LENGTH = 3          # number of context frames for predictor
 PRED_LENGTH = 1             # number of frames to predict per window
 LATENT_PRED_WEIGHT = 1.0    # weight of latent prediction loss
 ENCODER_FRAMES = 2          # frames channel-concatenated for velocity estimation
+
+# SIGReg (JEPA/hybrid mode)
+SIGREG_LAMBDA = 0.1         # SIGReg regularization weight (THE key LeWM hyperparameter)
+SIGREG_PROJECTIONS = 1024   # number of random projections (paper shows insensitive)
+SIGREG_KNOTS = 50           # quadrature knots for Epps-Pulley test
+DETERMINISTIC_ENCODER = False  # True = skip reparameterization, use mu directly
+
+# Hybrid mode
+HYBRID_RECON_WEIGHT = 0.0   # reconstruction loss weight in hybrid mode
 
 # Predictor
 PREDICTOR_TYPE = "hamiltonian"  # "mlp", "lstm", "transformer", "ode", "newtonian", "hamiltonian"
@@ -70,6 +87,88 @@ SEED = 42
 # Logging
 WANDB_PROJECT = "autoresearch"
 WANDB_ENABLED = HAS_WANDB and os.environ.get("WANDB_DISABLED", "").lower() != "true"
+
+# ---------------------------------------------------------------------------
+# SIGReg: Sketched-Isotropic-Gaussian Regularizer (LeWM / LeJEPA)
+# ---------------------------------------------------------------------------
+
+
+class SIGReg(nn.Module):
+    """Sketched-Isotropic-Gaussian Regularizer.
+
+    Enforces isotropic Gaussian distribution on latent embeddings by:
+    1. Projecting onto M random unit-norm directions (fixed, not learned)
+    2. Applying the Epps-Pulley univariate normality test to each projection
+    3. Averaging test statistics across all projections
+
+    By the Cramer-Wold theorem, matching all 1D marginals is equivalent
+    to matching the full joint distribution.
+
+    Reference: Balestriero & LeCun, "LeJEPA: Provable and Scalable
+    Self-Supervised Learning without the Heuristics" (2025).
+    """
+
+    def __init__(self, embed_dim, num_projections=1024, num_knots=50):
+        super().__init__()
+        self.num_projections = num_projections
+        # Fixed random projection directions on the unit hypersphere
+        directions = torch.randn(embed_dim, num_projections)
+        directions = F.normalize(directions, dim=0)
+        self.register_buffer("directions", directions)
+        # Quadrature knots for trapezoidal integration of EP statistic
+        self.register_buffer("knots", torch.linspace(0.2, 4.0, num_knots))
+
+    def forward(self, Z):
+        """Compute SIGReg loss.
+
+        Args:
+            Z: (N, D) latent embeddings flattened across batch and time.
+        Returns:
+            Scalar SIGReg loss (0 = perfectly isotropic Gaussian).
+        """
+        N, D = Z.shape
+        if N < 4:
+            return torch.tensor(0.0, device=Z.device)
+
+        # Project onto all directions at once: (N, D) @ (D, M) -> (N, M)
+        projections = Z @ self.directions  # (N, M)
+
+        # Standardize each projection
+        proj_mean = projections.mean(dim=0, keepdim=True)
+        proj_std = projections.std(dim=0, keepdim=True).clamp(min=1e-8)
+        h = (projections - proj_mean) / proj_std  # (N, M)
+
+        # Vectorized Epps-Pulley across all M projections simultaneously
+        t = self.knots  # (T,)
+        T_knots = t.shape[0]
+
+        # Empirical characteristic function for all projections
+        # h: (N, M), t: (T,) -> th: (T, N, M)
+        th = t[:, None, None] * h[None, :, :]  # (T, N, M)
+
+        # Real and imaginary parts of ECF, averaged over samples
+        cos_mean = torch.cos(th).mean(dim=1)  # (T, M)
+        sin_mean = torch.sin(th).mean(dim=1)  # (T, M)
+
+        # Target CF for N(0,1): exp(-t^2/2)
+        target_cf = torch.exp(-0.5 * t ** 2)  # (T,)
+
+        # Gaussian weight function
+        weight = torch.exp(-0.5 * t ** 2)  # (T,)
+
+        # Squared difference from target CF
+        diff_real = (cos_mean - target_cf[:, None]) ** 2  # (T, M)
+        diff_imag = sin_mean ** 2  # (T, M)
+
+        # Weighted integrand
+        integrand = weight[:, None] * (diff_real + diff_imag)  # (T, M)
+
+        # Trapezoidal integration over t, then average over projections
+        dt = t[1] - t[0]
+        per_proj = torch.trapezoid(integrand, dx=dt, dim=0)  # (M,)
+
+        return per_proj.mean()
+
 
 # ---------------------------------------------------------------------------
 # Building blocks
@@ -492,11 +591,15 @@ class VisualWorldModel(nn.Module):
     Structured as z = [z_q, z_p] split on last dim.
     z_q (position, first half) drives decoding;
     z_p (momentum, second half) carries dynamics information.
+
+    Supports two training modes:
+    - HGN: beta-VAE ELBO with reparameterization
+    - JEPA: end-to-end latent prediction with SIGReg anti-collapse
     """
 
     def __init__(self, predictor, latent_channels, hidden_channels, beta,
                  free_bits, context_length, pred_length, latent_pred_weight,
-                 encoder_frames, channels=3):
+                 encoder_frames, training_mode="hgn", channels=3):
         super().__init__()
         assert latent_channels % 2 == 0
         self.latent_channels = latent_channels
@@ -508,6 +611,7 @@ class VisualWorldModel(nn.Module):
         self.latent_pred_weight = latent_pred_weight
         self.encoder_frames = encoder_frames
         self.channels = channels
+        self.training_mode = training_mode
 
         self.encoder = VisionEncoder(
             channels=channels,
@@ -527,6 +631,16 @@ class VisualWorldModel(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_channels, latent_channels),
         )
+
+        # BatchNorm projector for JEPA mode (prevents LayerNorm/normalization
+        # from fighting SIGReg's Gaussian objective — see LeWM paper Sec 3.1)
+        if training_mode in ("jepa", "hybrid"):
+            self.encoder_projector = nn.Sequential(
+                nn.Linear(latent_channels, latent_channels),
+                nn.BatchNorm1d(latent_channels),
+            )
+        else:
+            self.encoder_projector = nn.Identity()
 
     def encode(self, images):
         mu, logvar = self.encoder(images)
@@ -549,6 +663,11 @@ class VisualWorldModel(nn.Module):
         )
         catted = windows.reshape(B * n_out, K * C, H, W)
         mu, logvar = self.encode(catted)
+
+        # Apply BatchNorm projector in JEPA/hybrid mode
+        if self.training_mode in ("jepa", "hybrid"):
+            mu = self.encoder_projector(mu)
+
         D = mu.shape[-1]
         return mu.reshape(B, n_out, D), logvar.reshape(B, n_out, D)
 
@@ -566,6 +685,9 @@ class VisualWorldModel(nn.Module):
         return self.decoder(z[..., :self.latent_channels // 2])
 
     def kl_loss(self, mu, logvar):
+        if self.training_mode in ("jepa", "hybrid"):
+            # No KL in JEPA mode — SIGReg handles regularization
+            return torch.tensor(0.0, device=mu.device)
         return kl_divergence_free_bits(mu, logvar, self.free_bits)
 
 
@@ -608,6 +730,7 @@ def build_model():
         pred_length=PRED_LENGTH,
         latent_pred_weight=LATENT_PRED_WEIGHT,
         encoder_frames=ENCODER_FRAMES,
+        training_mode=TRAINING_MODE,
     )
 
 
@@ -621,7 +744,7 @@ def _has_energy(predictor):
 
 
 def hgn_train_step(model, batch, optimizer):
-    """HGN training step with sliding-window predictor."""
+    """HGN training step with sliding-window predictor (original mode)."""
     images = batch["images"]
     actions = batch["actions"]
     B, _, C, H, W = images.shape
@@ -677,6 +800,92 @@ def hgn_train_step(model, batch, optimizer):
         "recon_loss": recon_loss.item(),
         "kl_loss": kl_loss.item(),
         "latent_pred_loss": latent_pred_loss.item(),
+        "sigreg_loss": 0.0,
+        "total_loss": loss.item(),
+    }
+
+
+def jepa_train_step(model, batch, optimizer, sigreg):
+    """LeWM-style JEPA training step.
+
+    Key differences from HGN:
+    1. Loss = latent_prediction + SIGReg (no reconstruction, no KL)
+    2. Gradients flow through encoder targets (no .detach())
+    3. SIGReg prevents collapse instead of KL divergence
+    4. Optionally deterministic encoding (no reparameterization)
+    """
+    images = batch["images"]
+    actions = batch["actions"]
+    B, _, C, H, W = images.shape
+    K = model.encoder_frames
+    ctx_len = model.context_length
+    pred_len = model.pred_length
+
+    # Encode all frames
+    mu_all, logvar_all = model.encode_sequence(images)
+    N_lat = mu_all.shape[1]
+    D_enc = mu_all.shape[2]
+
+    # Deterministic or stochastic encoding
+    if DETERMINISTIC_ENCODER:
+        mu_flat = mu_all.reshape(B * N_lat, D_enc)
+        all_states = model.to_state(mu_flat)
+    else:
+        mu_flat = mu_all.reshape(B * N_lat, D_enc)
+        logvar_flat = logvar_all.reshape(B * N_lat, D_enc)
+        all_states = model.reparameterize(mu_flat, logvar_flat)
+
+    D_state = all_states.shape[-1]
+    all_states = all_states.reshape(B, N_lat, D_state)
+
+    # SIGReg on encoded embeddings (prevents collapse)
+    sigreg_loss = sigreg(all_states.reshape(-1, D_state))
+
+    # Sliding window prediction
+    transition_actions = actions[:, K - 1:]
+    window_size = ctx_len + pred_len
+    step_size = pred_len
+    num_windows = max(1, 1 + (N_lat - window_size) // step_size)
+
+    latent_pred_loss = torch.tensor(0.0, device=images.device)
+    recon_loss = torch.tensor(0.0, device=images.device)
+
+    for w in range(num_windows):
+        start = w * step_size
+        end = min(start + window_size, N_lat)
+        w_states = all_states[:, start:end]
+        n_pred = w_states.shape[1] - 1
+
+        pred_input = w_states[:, :-1]
+        w_actions = transition_actions[:, start:start + n_pred].long()
+        pred_z = model.predictor(pred_input, w_actions)
+
+        # JEPA: predict latent targets — NO .detach() on targets!
+        # Gradients flow through the encoder, which is the key LeWM insight.
+        target_states = w_states[:, 1:]
+        latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
+
+        # Optional reconstruction for hybrid mode or monitoring
+        if HYBRID_RECON_WEIGHT > 0:
+            pred_decoded = model.decode(pred_z.reshape(B * n_pred, D_state))
+            gt_start = K - 1 + start + 1
+            gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
+            recon_loss = recon_loss + ((pred_decoded - gt_frames) ** 2).mean() / num_windows
+
+    # Total loss: prediction + SIGReg (+ optional reconstruction)
+    loss = latent_pred_loss + SIGREG_LAMBDA * sigreg_loss
+    if HYBRID_RECON_WEIGHT > 0:
+        loss = loss + HYBRID_RECON_WEIGHT * recon_loss
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    return {
+        "recon_loss": recon_loss.item() if HYBRID_RECON_WEIGHT > 0 else 0.0,
+        "kl_loss": 0.0,
+        "latent_pred_loss": latent_pred_loss.item(),
+        "sigreg_loss": sigreg_loss.item(),
         "total_loss": loss.item(),
     }
 
@@ -692,6 +901,19 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = build_model().to(device)
 validate_model_interface(model)
+
+# Build SIGReg module for JEPA/hybrid modes
+sigreg_module = None
+if TRAINING_MODE in ("jepa", "hybrid"):
+    sigreg_module = SIGReg(
+        embed_dim=LATENT_CHANNELS,
+        num_projections=SIGREG_PROJECTIONS,
+        num_knots=SIGREG_KNOTS,
+    ).to(device)
+    print(f"Training mode: {TRAINING_MODE} (SIGReg lambda={SIGREG_LAMBDA}, "
+          f"projections={SIGREG_PROJECTIONS}, deterministic={DETERMINISTIC_ENCODER})")
+else:
+    print(f"Training mode: {TRAINING_MODE} (beta={BETA})")
 
 num_params = sum(p.numel() for p in model.parameters())
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -726,9 +948,10 @@ if WANDB_ENABLED:
 
     wandb.init(
         project=WANDB_PROJECT,
-        name=f"{PREDICTOR_TYPE}/{BACKBONE or 'none'}/{git_hash}",
-        tags=[PREDICTOR_TYPE, BACKBONE or "no-backbone", git_branch],
+        name=f"{TRAINING_MODE}/{PREDICTOR_TYPE}/{BACKBONE or 'none'}/{git_hash}",
+        tags=[TRAINING_MODE, PREDICTOR_TYPE, BACKBONE or "no-backbone", git_branch],
         config={
+            "training_mode": TRAINING_MODE,
             "latent_channels": LATENT_CHANNELS,
             "hidden_channels": HIDDEN_CHANNELS,
             "beta": BETA,
@@ -737,6 +960,10 @@ if WANDB_ENABLED:
             "pred_length": PRED_LENGTH,
             "latent_pred_weight": LATENT_PRED_WEIGHT,
             "encoder_frames": ENCODER_FRAMES,
+            "sigreg_lambda": SIGREG_LAMBDA,
+            "sigreg_projections": SIGREG_PROJECTIONS,
+            "deterministic_encoder": DETERMINISTIC_ENCODER,
+            "hybrid_recon_weight": HYBRID_RECON_WEIGHT,
             "predictor_type": PREDICTOR_TYPE,
             "predictor_hidden": PREDICTOR_HIDDEN,
             "action_embedding_dim": ACTION_EMBEDDING_DIM,
@@ -776,7 +1003,12 @@ while True:
         t0 = time.time()
 
         batch = batch_to_device(batch, device)
-        losses = hgn_train_step(model, batch, optimizer)
+
+        # Dispatch to appropriate training step
+        if TRAINING_MODE in ("jepa", "hybrid"):
+            losses = jepa_train_step(model, batch, optimizer, sigreg_module)
+        else:
+            losses = hgn_train_step(model, batch, optimizer)
 
         torch.cuda.synchronize()
         t1 = time.time()
@@ -801,22 +1033,26 @@ while True:
         remaining = max(0, TIME_BUDGET - total_training_time)
 
         if WANDB_ENABLED:
-            wandb.log({
+            log_dict = {
                 "train/total_loss": train_loss,
                 "train/recon_loss": losses["recon_loss"],
                 "train/kl_loss": losses["kl_loss"],
                 "train/latent_pred_loss": losses["latent_pred_loss"],
+                "train/sigreg_loss": losses["sigreg_loss"],
                 "train/smooth_loss": debiased_loss,
                 "progress": progress,
-            }, step=step)
+            }
+            wandb.log(log_dict, step=step)
 
         if step % 50 == 0:
+            sigreg_str = f" | sigreg: {losses['sigreg_loss']:.4f}" if TRAINING_MODE in ("jepa", "hybrid") else ""
             print(
                 f"\rstep {step:05d} ({100*progress:.1f}%) | "
                 f"loss: {debiased_loss:.6f} | "
                 f"recon: {losses['recon_loss']:.4f} | "
                 f"kl: {losses['kl_loss']:.4f} | "
-                f"pred: {losses['latent_pred_loss']:.4f} | "
+                f"pred: {losses['latent_pred_loss']:.4f}"
+                f"{sigreg_str} | "
                 f"epoch: {epoch} | "
                 f"remaining: {remaining:.0f}s    ",
                 end="", flush=True,
@@ -869,6 +1105,7 @@ print(f"num_steps:         {step}")
 print(f"num_params_M:      {num_params / 1e6:.1f}")
 print(f"predictor_type:    {PREDICTOR_TYPE}")
 print(f"backbone:          {BACKBONE}")
+print(f"training_mode:     {TRAINING_MODE}")
 
 if WANDB_ENABLED:
     summary = {
