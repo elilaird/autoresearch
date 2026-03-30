@@ -8,7 +8,7 @@ This is an experiment to have the LLM do its own research on physics world model
 
 This project learns physics dynamics from visual observations (64×64 rendered oscillator images) using a beta-VAE with a swappable latent-space predictor. The encoder maps frames to a flat latent space z = [q, p] (position + momentum), the predictor evolves latent states forward in time, and the decoder reconstructs images from the position half.
 
-The **core research question** is: which predictor architecture generalizes best across different sampling rates (dt)? The model trains on dt=0.2 data but is evaluated on dt=0.1 (interpolation) and dt=0.5 (extrapolation). Physics-informed predictors (Hamiltonian, Newtonian) should theoretically generalize better than learned dynamics (MLP, LSTM) because they encode the structure of physical laws.
+The **core research question** is: which architecture best learns both high-fidelity reconstruction and accurate latent-space dynamics? The model is evaluated on **val_recon_loss** (reconstruction quality) and **val_latent_pred** (latent prediction accuracy). The combined score `val_recon_loss + val_latent_pred` is the primary metric. Do NOT optimize for `val_dt_score` — it saturates easily and does not reflect meaningful representation quality (e.g., a 2-channel CNN can achieve "perfect" dt generalization while learning nothing useful). Focus on driving down reconstruction loss and latent prediction error.
 
 ## How it works
 
@@ -59,7 +59,7 @@ Each experiment runs on a single GPU via SLURM. The training script runs for a *
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, environment, and training constants (time budget, eval dt values, etc).
 - Install new packages or add dependencies. You can only use what's already available in the conda environment (`world_models`).
-- Modify the evaluation harness. The `evaluate_dt_generalization` function in `prepare.py` is the ground truth metric.
+- Modify the evaluation harness in `prepare.py`.
 
 **The goal is simple: get the lowest combined val_recon_loss + val_latent_pred.** These two metrics measure reconstruction quality and latent-space prediction accuracy respectively. Since the time budget is fixed, you don't need to worry about training time — it's always 15 minutes. Everything is fair game: change the predictor type, the backbone, the encoder, the decoder, the optimizer, the hyperparameters, the integration method, the loss function. The only constraint is that the code runs without crashing and finishes within the time budget.
 
@@ -114,13 +114,10 @@ Once the script finishes it prints a summary like this:
 
 ```
 ---
-val_dt_score:      0.012345
 val_recon_loss:    0.001234
-val_kl_loss:       12.3456
 val_latent_pred:   0.004567
-dt_0.1_mse:        0.008123
-dt_0.2_mse:        0.011234
-dt_0.5_mse:        0.017678
+val_kl_loss:       12.3456
+val_dt_score:      0.012345
 training_seconds:  900.1
 total_seconds:     1020.5
 peak_vram_mb:      8045.2
@@ -130,6 +127,8 @@ num_params_M:      3.2
 predictor_type:    hamiltonian
 backbone:          transformer
 ```
+
+**Important**: `val_recon_loss` and `val_latent_pred` are what matter. `val_dt_score` is printed for reference only — do NOT use it as an optimization target.
 
 ## Logging results
 
